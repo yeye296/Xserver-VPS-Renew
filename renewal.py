@@ -174,19 +174,26 @@ class CaptchaSolver:
 
 # ======================== 邮箱验证码（Outlook IMAP） ==========================
 
+# ======================== 邮箱验证码（IMAP：推荐 Gmail App Password） ==========================
+
 class EmailCodeFetcher:
     """
     通过 IMAP 拉取邮箱验证码（用于“新环境登录验证”）
-    - 优先提取 5~6 位（XServer 常见 5 位：如 79933）
-    - 再兜底提取 4~8 位
+
+    关键修复：
+    - IMAP SEARCH 条件必须是 ASCII，否则 imaplib 会尝试用 ascii 编码导致报错
+    - 所以：SEARCH 只用 (UNSEEN)；然后在 Python 里用 Unicode 过滤 From/Subject
+    - 优先提取 5~6 位（XServer 常见 5 位），再兜底 4~8 位
     """
 
     def __init__(self):
         self.host = Config.MAIL_IMAP_HOST
         self.user = Config.MAIL_IMAP_USER
         self.password = Config.MAIL_IMAP_PASS
-        self.from_filter = Config.MAIL_FROM_FILTER
-        self.subject_filter = Config.MAIL_SUBJECT_FILTER
+
+        # 这里允许填日文/中文，因为我们不再把它们放进 IMAP SEARCH
+        self.from_filter = (Config.MAIL_FROM_FILTER or "").strip()
+        self.subject_filter = (Config.MAIL_SUBJECT_FILTER or "").strip()
 
     def _extract_code(self, text: str) -> Optional[str]:
         if not text:
@@ -232,7 +239,47 @@ class EmailCodeFetcher:
         combined = "\n".join(body_texts)
         return f"SUBJECT:\n{subject}\n\nFROM:\n{from_}\n\nBODY:\n{combined}"
 
-    def fetch_latest_code(self, timeout_sec: int = 120, poll_interval: int = 5) -> Optional[str]:
+    def _match_filters(self, msg) -> bool:
+        """
+        Python 端过滤（支持日文/中文）
+        """
+        from email.header import decode_header
+
+        def decode_header_value(v):
+            if not v:
+                return ""
+            parts = decode_header(v)
+            out = []
+            for s, enc in parts:
+                if isinstance(s, bytes):
+                    out.append(s.decode(enc or "utf-8", errors="ignore"))
+                else:
+                    out.append(s)
+            return "".join(out)
+
+        subj = decode_header_value(msg.get("Subject"))
+        frm = decode_header_value(msg.get("From"))
+
+        # 统一小写做包含判断（对日文无影响，对英文更稳）
+        subj_l = subj.lower()
+        frm_l = frm.lower()
+
+        if self.from_filter:
+            if self.from_filter.lower() not in frm_l:
+                return False
+
+        if self.subject_filter:
+            if self.subject_filter.lower() not in subj_l:
+                return False
+
+        return True
+
+    def fetch_latest_code(self, timeout_sec: int = 180, poll_interval: int = 6, scan_last_n: int = 12) -> Optional[str]:
+        """
+        - timeout_sec：总等待时间（建议 180 秒，邮件有时会慢）
+        - poll_interval：轮询间隔
+        - scan_last_n：每轮最多检查最近 N 封未读（防止 INBOX 太大）
+        """
         if not all([self.host, self.user, self.password]):
             logger.warning("⚠️ 未配置 MAIL_IMAP_*，无法自动收取邮箱验证码")
             return None
@@ -250,13 +297,8 @@ class EmailCodeFetcher:
                 mail.login(self.user, self.password)
                 mail.select("INBOX")
 
-                criteria = ["UNSEEN"]
-                if self.from_filter:
-                    criteria += ["FROM", f"\"{self.from_filter}\""]
-                if self.subject_filter:
-                    criteria += ["SUBJECT", f"\"{self.subject_filter}\""]
-
-                typ, data = mail.search(None, *criteria)
+                # ✅ 只用 ASCII 条件搜索，避免 ascii 编码报错
+                typ, data = mail.search(None, "UNSEEN")
                 if typ != "OK":
                     mail.logout()
                     raise Exception(f"IMAP search failed: {typ}")
@@ -268,25 +310,39 @@ class EmailCodeFetcher:
                     time.sleep(poll_interval)
                     continue
 
-                latest_id = ids[-1]
-                typ, msg_data = mail.fetch(latest_id, "(RFC822)")
-                if typ != "OK":
-                    mail.logout()
-                    raise Exception(f"IMAP fetch failed: {typ}")
+                # 从最新开始扫
+                ids_to_scan = list(reversed(ids[-scan_last_n:]))
 
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
-                content = self._decode_email_payload(msg)
+                found_any = False
+                for mid in ids_to_scan:
+                    typ, msg_data = mail.fetch(mid, "(RFC822)")
+                    if typ != "OK":
+                        continue
 
-                code = self._extract_code(content)
-                if code:
-                    mail.store(latest_id, "+FLAGS", "\\Seen")
-                    mail.logout()
-                    logger.info(f"✅ 邮箱验证码获取成功: {code}")
-                    return code
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+
+                    # Python 端过滤（支持日文/中文）
+                    if not self._match_filters(msg):
+                        continue
+
+                    found_any = True
+                    content = self._decode_email_payload(msg)
+                    code = self._extract_code(content)
+                    if code:
+                        # 标记已读，防止下次重复读到
+                        mail.store(mid, "+FLAGS", "\\Seen")
+                        mail.logout()
+                        logger.info(f"✅ 邮箱验证码获取成功: {code}")
+                        return code
 
                 mail.logout()
-                logger.info("📩 收到新邮件但未提取到验证码，继续等待...")
+
+                if found_any:
+                    logger.info("📩 收到匹配邮件但未提取到验证码，继续等待...")
+                else:
+                    logger.info("📭 有未读邮件，但未匹配 From/Subject 过滤条件，继续等待...")
+
                 time.sleep(poll_interval)
 
             except Exception as e:
