@@ -388,25 +388,19 @@ class XServerVPSRenewal:
                 "--start-maximized",
             ]
 
-            # Turnstile：强制 headless=False（在 Actions 里用 xvfb-run）
+            # 当前策略：不在 Playwright 启动阶段使用代理（避免 socks5 认证导致 launch 失败）
+            if Config.PROXY_SERVER:
+                logger.info("ℹ️ 已配置 PROXY_SERVER，但当前策略不启用全程代理（避免 launch 失败）")
+
             if Config.USE_HEADLESS:
-                logger.info("⚠️ 检测到 USE_HEADLESS=true，但为通过 Turnstile 强制 headless=False")
+                logger.info("⚠️ 为了通过 Turnstile，强制使用非无头模式(headless=False)")
             else:
                 logger.info("ℹ️ 已配置非无头模式(headless=False)")
 
             launch_kwargs = {
                 "headless": False,
-                "args": launch_args
+                "args": launch_args,
             }
-
-            # 重要：不再在 Playwright 启动阶段设置代理
-            # 说明：GitHub Actions 环境的 Chromium 不支持 socks5 代理认证（会导致 launch 直接失败）
-            # 当前策略：直连运行；若触发邮箱验证，则立刻中断，避免频繁验证/封号风控
-            if Config.PROXY_SERVER:
-                logger.info("ℹ️ 已配置 PROXY_SERVER，但当前策略不启用全程代理（避免 launch 失败）")
-            else:
-                logger.info("ℹ️ 未配置 PROXY_SERVER，将直连运行")
-
 
             self.browser = await self._pw.chromium.launch(**launch_kwargs)
 
@@ -423,7 +417,6 @@ class XServerVPSRenewal:
 
             self.context = await self.browser.new_context(**context_options)
 
-            # 基础 anti-bot
             await self.context.add_init_script("""
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
@@ -438,18 +431,21 @@ Object.defineProperty(navigator, 'permissions', {
             self.page = await self.context.new_page()
             self.page.set_default_timeout(Config.WAIT_TIMEOUT)
 
-                        # 代理生效校验：浏览器出口 IP（当前策略：不要求全程代理，因此只做记录，不做中断）
+            if STEALTH_VERSION == "old" and stealth_async is not None:
+                await stealth_async(self.page)
+            else:
+                logger.info("ℹ️ 使用新版 playwright_stealth 或未安装,跳过 stealth 处理")
+
+            # ===== 仅记录 IP，不做中断 =====
             self.browser_exit_ip = await self._get_browser_exit_ip()
             if self.browser_exit_ip:
                 logger.info(f"🌐 浏览器出口 IP: {self.browser_exit_ip}")
             else:
-                logger.warning("⚠️ 未能获取浏览器出口 IP（跳过代理校验）")
+                logger.warning("⚠️ 未能获取浏览器出口 IP")
 
             if Config.RUNNER_IP:
                 logger.info(f"🌍 GitHub Runner 出口 IP: {Config.RUNNER_IP}")
 
-            # ✅ 不需要全程代理：不再强制要求 browser_exit_ip != runner_ip
-            # 仅记录提示，后续真正的“防邮箱验证”依赖登录阶段检测到邮箱验证页后立刻中断（NeedVerify）
             if self.browser_exit_ip and Config.RUNNER_IP and self.browser_exit_ip == Config.RUNNER_IP:
                 logger.warning(
                     f"⚠️ browser_exit_ip == runner_ip == {self.browser_exit_ip}（当前策略允许直连，继续执行）"
@@ -457,6 +453,12 @@ Object.defineProperty(navigator, 'permissions', {
 
             logger.info("✅ 浏览器初始化成功")
             return True
+
+        except Exception as e:
+            logger.error(f"❌ 浏览器初始化失败: {e}")
+            self.error_message = str(e)
+            return False
+
 
     # ---------- 登录（含方案B：自动邮箱验证码） ----------
     async def login(self) -> bool:
