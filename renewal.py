@@ -3,10 +3,9 @@
 
 """
 XServer VPS 自动续期脚本（方案 B：自动收 Outlook 邮箱验证码）
-- Playwright 原生 proxy 参数（支持 socks5://user:pass@host:port）
 - Turnstile：强制使用 headless=False（配合 GitHub Actions 用 xvfb-run）
 - 登录如遇“新环境登录验证”，自动点发送验证码 → IMAP 拉取邮件 → 自动回填验证码
-- 代理校验：获取“浏览器出口 IP”，如果 == RUNNER_IP（说明没走代理），立刻中断续期并输出 IP
+- 代理校验：仅记录“浏览器出口 IP / RUNNER_IP”，不强制中断（避免误杀）
 """
 
 import asyncio
@@ -16,10 +15,21 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
+
+
+# ======================== Playwright Stealth 兼容处理 ========================
+
+try:
+    # 旧版 playwright-stealth
+    from playwright_stealth import stealth_async
+    STEALTH_VERSION = "old"
+except Exception:
+    stealth_async = None
+    STEALTH_VERSION = "none"
 
 
 # ======================== 配置 ==========================
@@ -340,12 +350,8 @@ class XServerVPSRenewal:
         except Exception:
             pass
 
-    # ---------- 代理解析 ----------
+    # ---------- 代理解析（保留：若未来要启用 context 代理可用） ----------
     def _parse_proxy(self, proxy_url: str) -> Dict:
-        """
-        支持 socks5://user:pass@host:port 或 http://host:port
-        Playwright proxy 需要拆成 server/username/password
-        """
         p = urlparse(proxy_url)
         if not p.scheme or not p.hostname or not p.port:
             raise ValueError("PROXY_SERVER 格式不正确，应为 socks5://user:pass@host:port 或 http://host:port")
@@ -388,7 +394,7 @@ class XServerVPSRenewal:
                 "--start-maximized",
             ]
 
-            # 当前策略：不在 Playwright 启动阶段使用代理（避免 socks5 认证导致 launch 失败）
+            # 当前策略：不在 launch 阶段使用代理（避免 socks5 认证导致 launch 失败）
             if Config.PROXY_SERVER:
                 logger.info("ℹ️ 已配置 PROXY_SERVER，但当前策略不启用全程代理（避免 launch 失败）")
 
@@ -431,12 +437,14 @@ Object.defineProperty(navigator, 'permissions', {
             self.page = await self.context.new_page()
             self.page.set_default_timeout(Config.WAIT_TIMEOUT)
 
+            # stealth（可选）
             if STEALTH_VERSION == "old" and stealth_async is not None:
                 await stealth_async(self.page)
+                logger.info("✅ 已启用 playwright-stealth(old)")
             else:
-                logger.info("ℹ️ 使用新版 playwright_stealth 或未安装,跳过 stealth 处理")
+                logger.info("ℹ️ 未启用 stealth（未安装或非 old 版本）")
 
-            # ===== 仅记录 IP，不做中断 =====
+            # 记录 IP
             self.browser_exit_ip = await self._get_browser_exit_ip()
             if self.browser_exit_ip:
                 logger.info(f"🌐 浏览器出口 IP: {self.browser_exit_ip}")
@@ -447,9 +455,7 @@ Object.defineProperty(navigator, 'permissions', {
                 logger.info(f"🌍 GitHub Runner 出口 IP: {Config.RUNNER_IP}")
 
             if self.browser_exit_ip and Config.RUNNER_IP and self.browser_exit_ip == Config.RUNNER_IP:
-                logger.warning(
-                    f"⚠️ browser_exit_ip == runner_ip == {self.browser_exit_ip}（当前策略允许直连，继续执行）"
-                )
+                logger.warning(f"⚠️ browser_exit_ip == runner_ip == {self.browser_exit_ip}（当前策略允许直连，继续执行）")
 
             logger.info("✅ 浏览器初始化成功")
             return True
@@ -458,7 +464,6 @@ Object.defineProperty(navigator, 'permissions', {
             logger.error(f"❌ 浏览器初始化失败: {e}")
             self.error_message = str(e)
             return False
-
 
     # ---------- 登录（含方案B：自动邮箱验证码） ----------
     async def login(self) -> bool:
@@ -505,17 +510,31 @@ Object.defineProperty(navigator, 'permissions', {
                 logger.error(f"❌ {self.error_message}")
                 return False
 
-            # ✅ 不需要全程代理的策略：一旦触发“新环境登录验证”，立刻中断，避免反复触发风控
-            logger.error("🛑 检测到“新环境登录验证/邮箱验证码”页面：为避免反复验证，本次任务直接中断")
+            logger.warning("🔐 检测到“新环境登录验证/邮箱验证码”页面，尝试自动发送验证码并收码...")
+
             await self.shot("03b_need_email_verify")
 
-            self.renewal_status = "NeedVerify"
-            self.error_message = (
-                "登录触发邮箱验证（新环境验证）。已中断续期以避免反复触发验证。\n"
-                "建议：手动在稳定出口登录一次完成验证；或使用自建 Runner/固定出口再运行。"
-            )
-            return False
+            # 1) 点击“发送验证码”按钮
+            sent = False
+            try:
+                # 常见：input submit / button submit，value 或文本含“送信”
+                btn = self.page.locator(
+                    "input[type='submit'][value*='送信'], button:has-text('送信'), button[type='submit'], input[type='submit']"
+                ).first
+                if await btn.count() > 0:
+                    await btn.click()
+                    sent = True
+            except Exception:
+                sent = False
 
+            await asyncio.sleep(2)
+            await self.shot("03c_after_send_code")
+
+            if not sent:
+                self.renewal_status = "NeedVerify"
+                self.error_message = "需要新环境验证，但未能点击“发送验证码”按钮"
+                logger.error(f"❌ {self.error_message}")
+                return False
 
             # 2) 拉取邮箱验证码（最长 120 秒）
             logger.info("📧 等待邮箱验证码（IMAP 轮询）...")
@@ -536,7 +555,9 @@ Object.defineProperty(navigator, 'permissions', {
 
             filled = False
             try:
-                inp = self.page.locator("input[type='text'], input[type='tel'], input[name*='code'], input[name*='auth']").first
+                inp = self.page.locator(
+                    "input[type='text'], input[type='tel'], input[name*='code'], input[name*='auth']"
+                ).first
                 if await inp.count() > 0:
                     await inp.fill(code)
                     filled = True
@@ -573,7 +594,9 @@ Object.defineProperty(navigator, 'permissions', {
 
             submitted = False
             try:
-                btn2 = self.page.locator("button:has-text('認証'), button:has-text('確認'), input[type='submit'], button[type='submit']").first
+                btn2 = self.page.locator(
+                    "button:has-text('認証'), button:has-text('確認'), input[type='submit'], button[type='submit']"
+                ).first
                 if await btn2.count() > 0:
                     await btn2.click()
                     submitted = True
@@ -588,7 +611,6 @@ Object.defineProperty(navigator, 'permissions', {
                 logger.info("🎉 邮箱验证通过，登录成功")
                 return True
 
-            # 失败时输出页面片段帮助排查
             hint = ""
             try:
                 hint = await self.page.evaluate("""
@@ -737,7 +759,7 @@ Object.defineProperty(navigator, 'permissions', {
             logger.warning(f"⚠️ 打开续期页面异常: {e}")
             return False
 
-    # ---------- Turnstile 检测/尝试点击（简化版，保留你原本思路） ----------
+    # ---------- Turnstile（简化版） ----------
     async def complete_turnstile_verification(self, max_wait: int = 90) -> bool:
         try:
             has_turnstile = await self.page.evaluate("() => document.querySelector('.cf-turnstile') !== null")
@@ -748,7 +770,7 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("🔐 检测到 Turnstile，尝试点击触发验证...")
             await asyncio.sleep(2)
 
-            # 尝试点击 iframe 中心附近
+            # 点击 iframe 中心附近
             try:
                 info = await self.page.evaluate("""
                     () => {
@@ -768,8 +790,8 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception:
                 pass
 
-            # 等待 token 出现
-            for i in range(max_wait):
+            # 等待 token
+            for _ in range(max_wait):
                 await asyncio.sleep(1)
                 ok = await self.page.evaluate("""
                     () => {
@@ -794,11 +816,9 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("📄 开始提交续期表单")
             await asyncio.sleep(2)
 
-            # Turnstile
             await self.complete_turnstile_verification(max_wait=90)
             await asyncio.sleep(1)
 
-            # 找验证码图片
             logger.info("🔍 查找续期验证码图片...")
             img_data_url = await self.page.evaluate("""
                 () => {
@@ -819,7 +839,6 @@ Object.defineProperty(navigator, 'permissions', {
 
             await self.shot("08_captcha_found")
 
-            # OCR
             code = await self.captcha_solver.solve(img_data_url)
             if not code:
                 self.renewal_status = "Failed"
@@ -850,7 +869,6 @@ Object.defineProperty(navigator, 'permissions', {
             await asyncio.sleep(1)
             await self.shot("09_captcha_filled")
 
-            # 提交
             logger.info("🖱️ 提交续期表单...")
             await self.shot("10_before_submit")
             submitted = await self.page.evaluate("""
@@ -878,7 +896,6 @@ Object.defineProperty(navigator, 'permissions', {
 
             html = await self.page.content()
 
-            # 错误
             if any(err in html for err in [
                 "入力された認証コードが正しくありません",
                 "認証コードが正しくありません",
@@ -891,7 +908,6 @@ Object.defineProperty(navigator, 'permissions', {
                 await self.shot("11_error")
                 return False
 
-            # 成功
             if any(success in html for success in ["完了", "継続", "完成", "更新しました"]):
                 logger.info("🎉 续期成功")
                 self.renewal_status = "Success"
@@ -930,11 +946,6 @@ Object.defineProperty(navigator, 'permissions', {
                 "## ℹ️ 尚未到续期窗口\n\n"
                 f"- 🕛 **到期时间**: `{self.old_expiry_time}`\n"
             )
-        elif self.renewal_status == "Aborted":
-            out += (
-                "## 🛑 已中断（代理疑似未生效）\n\n"
-                f"- ⚠️ **原因**: {self.error_message or '未知'}\n"
-            )
         elif self.renewal_status == "NeedVerify":
             out += (
                 "## 🔐 需要邮箱验证/收码失败\n\n"
@@ -962,13 +973,12 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("🚀 XServer VPS 自动续期开始")
             logger.info("=" * 60)
 
-            # 1) 启动浏览器（包含代理校验/可能中断）
+            # 1) 启动浏览器
             ok = await self.setup_browser()
             if not ok:
-                if self.renewal_status != "Aborted":
-                    self.renewal_status = self.renewal_status if self.renewal_status != "Unknown" else "Failed"
+                self.renewal_status = "Failed" if self.renewal_status == "Unknown" else self.renewal_status
                 self.generate_readme()
-                await Notifier.notify("❌ 续期失败/中断", self.error_message or "浏览器初始化失败")
+                await Notifier.notify("❌ 续期失败", self.error_message or "浏览器初始化失败")
                 return
 
             # 2) 登录（含邮箱自动验证）
@@ -1036,8 +1046,6 @@ Object.defineProperty(navigator, 'permissions', {
                 await Notifier.notify("ℹ️ 尚未到期", f"当前到期时间: {self.old_expiry_time}")
             elif self.renewal_status == "NeedVerify":
                 await Notifier.notify("🔐 邮箱验证异常", self.error_message or "邮箱验证异常")
-            elif self.renewal_status == "Aborted":
-                await Notifier.notify("🛑 已中断", self.error_message or "已中断")
             else:
                 await Notifier.notify("❌ 续期失败", f"错误信息: {self.error_message or '未知错误'}")
 
