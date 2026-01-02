@@ -3,16 +3,17 @@
 
 """
 XServer VPS 自动续期脚本（方案 C：清理旧未读邮件 + 自动收 Outlook 邮箱验证码）
-改动点（按你的要求）：
-- 登录页固定为：https://secure.xserver.ne.jp/xapanel/login/xvps/
-- 登录成功后，直接访问续期入口页：
-    https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/index
-- 续期流程只保留这两个按钮步骤：
-    1) 点击「期限を延長する」
-    2) 点击「期限を延長する」（确认页第二次确认）
-  （也就是你说的“网页只需要保留这两个”）
-- 方案C关键：点击“发送验证码”前，先把旧的“验证码相关未读邮件”全部标为已读（Seen），避免读到旧验证码
-- 解决 Outlook IMAP 搜索 ascii 报错：如果 SUBJECT/FROM 过滤包含非 ASCII（如日文），自动跳过该过滤
+
+按你本次要求的改动：
+1) EXTEND_INDEX_URL 改为：
+   https://secure.xserver.ne.jp/xapanel/xmgame/jumpvps/?id={VPS_ID}
+2) 成功访问 jumpvps 后，再访问续期页：
+   https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input
+3) 续期流程改回「確認」链路：
+   1) 点击「確認画面に進む」（或兜底：確認）
+   2) 点击「期限を延長する」（或兜底：延長）
+（保留方案C：发送验证码前清理旧未读验证码邮件，避免读到旧验证码）
+（保留：SUBJECT/FROM 过滤含非 ASCII 自动跳过，避免 IMAP ascii 报错）
 """
 
 import asyncio
@@ -22,7 +23,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Dict, List
+from typing import Optional, List
 
 from playwright.async_api import async_playwright
 
@@ -64,11 +65,14 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    # ✅ 登录页（按你要求）
+    # 登录页
     LOGIN_URL = "https://secure.xserver.ne.jp/xapanel/login/xvps/"
 
-    # ✅ 登录后直接访问的续期入口（按你要求）
-    EXTEND_INDEX_URL = "https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/index"
+    # ✅ 先跳转到 xmgame（按你要求）
+    EXTEND_INDEX_URL = f"https://secure.xserver.ne.jp/xapanel/xmgame/jumpvps/?id={VPS_ID}"
+
+    # ✅ 再进入续期页面（按你要求）
+    EXTEND_INPUT_URL = "https://secure.xserver.ne.jp/xmgame/game/freeplan/extend/input"
 
     # 旧版 xvps 到期详情（保留，用于读取到期日）
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
@@ -109,7 +113,6 @@ class Notifier:
 
     @staticmethod
     async def notify(subject: str, message: str):
-        # subject 预留
         await Notifier.send_telegram(message)
 
 
@@ -454,8 +457,8 @@ Object.defineProperty(navigator, 'permissions', {
 
             current_url = self.page.url
 
-            # 登录成功判定（更宽松：只要不在 login 页面就算进去了）
-            if ("login" not in current_url.lower()):
+            # 登录成功判定（只要不在 login 页面就算进去了）
+            if "login" not in current_url.lower():
                 logger.info("🎉 登录成功")
                 return True
 
@@ -638,72 +641,88 @@ Object.defineProperty(navigator, 'permissions', {
             logger.error(f"❌ 获取到期时间失败: {e}")
             return False
 
-    # ---------- 续期：只保留「期限を延長する」两次点击 ----------
-    async def extend_two_click_only(self) -> bool:
+    # ---------- 续期流程：jumpvps -> extend/input -> 確認 -> 延長 ----------
+    async def extend_via_jumpvps_then_confirm(self) -> bool:
         """
-        按你的要求：
-        - 登录后直接访问 EXTEND_INDEX_URL
-        - 页面只保留这两个步骤：
-            1) 点击「期限を延長する」
-            2) 点击「期限を延長する」（确认页）
+        按你要求的流程：
+          1) 访问 jumpvps/?id={VPS_ID}（让它把 session 带到 xmgame）
+          2) 访问 extend/input
+          3) 点击「確認画面に進む」（或兜底：確認）
+          4) 点击「期限を延長する」（或兜底：延長）
         """
         try:
-            logger.info(f"🌐 打开续期入口页: {Config.EXTEND_INDEX_URL}")
-            await self.page.goto(Config.EXTEND_INDEX_URL, timeout=Config.WAIT_TIMEOUT)
+            logger.info(f"🌐 Step0: 访问 jumpvps: {Config.EXTEND_INDEX_URL}")
+            await self.page.goto(Config.EXTEND_INDEX_URL, timeout=Config.WAIT_TIMEOUT, wait_until="domcontentloaded")
             await asyncio.sleep(2)
-            await self.shot("05_extend_index")
+            await self.shot("05_jumpvps")
 
-            # Step 1: 点击「期限を延長する」
-            step = self.page.locator(
-                "button:has-text('期限を延長する'), a:has-text('期限を延長する'), input[type='submit'][value*='延長']"
-            ).first
-
-            if await step.count() == 0:
-                # 兜底：只要包含“延長”
-                step = self.page.locator("button:has-text('延長'), a:has-text('延長')").first
-
-            if await step.count() == 0:
-                self.error_message = "续期失败：在入口页未找到「期限を延長する/延長」按钮"
+            # 简单判断是否“成功访问”：只要不是被丢回 login
+            if "login" in (self.page.url or "").lower():
+                self.error_message = f"jumpvps 访问后仍在登录页：url={self.page.url}"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("05b_no_extend_button")
+                await self.shot("05a_jumpvps_back_to_login")
                 return False
 
-            logger.info("🖱️ 续期第1步：点击「期限を延長する」")
-            await step.click()
+            logger.info(f"🌐 Step1: 访问续期页 extend/input: {Config.EXTEND_INPUT_URL}")
+            await self.page.goto(Config.EXTEND_INPUT_URL, timeout=Config.WAIT_TIMEOUT, wait_until="domcontentloaded")
             await asyncio.sleep(2)
-            await self.shot("06_after_extend_click_1")
+            await self.shot("06_extend_input")
 
-            # Step 2: 再次点击「期限を延長する」（确认页）
+            if "login" in (self.page.url or "").lower():
+                self.error_message = f"访问 extend/input 被重定向回登录：url={self.page.url}"
+                logger.error(f"❌ {self.error_message}")
+                await self.shot("06a_extend_input_back_to_login")
+                return False
+
+            # Step2: 点击「確認画面に進む」
+            step1 = self.page.locator(
+                "button:has-text('確認画面に進む'), a:has-text('確認画面に進む'), input[type='submit'][value*='確認']"
+            ).first
+            if await step1.count() == 0:
+                step1 = self.page.locator("button:has-text('確認'), a:has-text('確認')").first
+
+            if await step1.count() == 0:
+                self.error_message = "续期失败：未找到「確認画面に進む/確認」按钮"
+                logger.error(f"❌ {self.error_message}")
+                await self.shot("06b_no_confirm_button")
+                return False
+
+            logger.info("🖱️ Step2: 点击「確認画面に進む」")
+            await step1.click()
+            await asyncio.sleep(2)
+            await self.shot("07_confirm_page")
+
+            # Step3: 点击「期限を延長する」
             step2 = self.page.locator(
                 "button:has-text('期限を延長する'), a:has-text('期限を延長する'), input[type='submit'][value*='延長']"
             ).first
-
             if await step2.count() == 0:
                 step2 = self.page.locator("button:has-text('延長'), a:has-text('延長')").first
 
             if await step2.count() == 0:
-                self.error_message = "续期失败：在确认页未找到第二次「期限を延長する/延長」按钮"
+                self.error_message = "续期失败：未找到「期限を延長する/延長」按钮"
                 logger.error(f"❌ {self.error_message}")
-                await self.shot("06b_no_extend_button_2")
+                await self.shot("07b_no_extend_button")
                 return False
 
-            logger.info("🖱️ 续期第2步：点击「期限を延長する」（确认页）")
+            logger.info("🖱️ Step3: 点击「期限を延長する」")
             await step2.click()
             await asyncio.sleep(3)
-            await self.shot("07_extend_done")
+            await self.shot("08_extend_done")
 
+            # 成功关键字（尽量宽松）
             page_text = ""
             try:
                 page_text = await self.page.evaluate("() => (document.body.innerText || document.body.textContent || '')")
             except Exception:
                 page_text = ""
 
-            if any(k in page_text for k in ["完了", "延長", "成功", "更新"]):
+            if any(k in page_text for k in ["完了", "延長", "成功", "更新", "手続きが完了"]):
                 logger.info("🎉 续期操作已提交（页面出现成功/完成提示）")
                 self.renewal_status = "Success"
                 return True
 
-            logger.warning("⚠️ 未检测到明确成功关键字，但已完成两次点击（请看截图确认）")
+            logger.warning("⚠️ 未检测到明确成功关键字，但已完成「確認 -> 延長」点击（请看截图确认）")
             self.renewal_status = "Unknown"
             return True
 
@@ -732,7 +751,7 @@ Object.defineProperty(navigator, 'permissions', {
             out += f"- ⚠️ **原因**: {self.error_message or '未知'}\n"
         elif self.renewal_status == "Unknown":
             out += "## ⚠️ 已完成点击但状态不确定\n\n"
-            out += "- 已执行两次「期限を延長する」点击，请查看截图确认页面提示。\n"
+            out += "- 已执行「確認画面に進む」+「期限を延長する」，请查看截图确认页面提示。\n"
         else:
             out += "## ❌ 续期失败\n\n"
             out += f"- ⚠️ **错误**: {self.error_message or '未知'}\n"
@@ -769,8 +788,8 @@ Object.defineProperty(navigator, 'permissions', {
             # 3) 读取到期日（可选）
             await self.get_expiry()
 
-            # 4) ✅ 登录成功后直接访问 extend/index 并只做两次「期限を延長する」
-            ok = await self.extend_two_click_only()
+            # 4) ✅ 按你指定：jumpvps -> extend/input -> 確認 -> 延長
+            ok = await self.extend_via_jumpvps_then_confirm()
             if not ok:
                 self.renewal_status = "Failed"
                 self.generate_readme()
@@ -782,9 +801,9 @@ Object.defineProperty(navigator, 'permissions', {
             self.generate_readme()
 
             if self.renewal_status == "Success":
-                await Notifier.notify("✅ 续期成功", "已完成两次「期限を延長する」点击（建议查看截图确认页面提示）")
+                await Notifier.notify("✅ 续期成功", "已完成：jumpvps -> extend/input -> 確認 -> 延長（建议查看截图确认页面提示）")
             elif self.renewal_status == "Unknown":
-                await Notifier.notify("⚠️ 续期完成但状态不确定", "已完成两次点击，但未匹配到明确成功关键字，请看截图。")
+                await Notifier.notify("⚠️ 续期完成但状态不确定", "已完成点击，但未匹配到明确成功关键字，请看截图。")
             else:
                 await Notifier.notify("❌ 续期失败", self.error_message or "未知错误")
 
