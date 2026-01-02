@@ -21,7 +21,7 @@ jobs:
     name: 🔄 执行续期任务
     runs-on: ubuntu-latest
 
-    # ========== 🔧 关键：添加 FlareSolverr 服务容器 ==========
+    # ========== 🔧 FlareSolverr 服务容器（可保留，不影响方案B邮箱验证） ==========
     services:
       flaresolverr:
         image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -33,7 +33,6 @@ jobs:
 
     steps:
       # ========== 📦 准备阶段 ==========
-
       - name: 📥 检出代码仓库
         uses: actions/checkout@v4
         with:
@@ -87,7 +86,7 @@ jobs:
           fi
 
       # ========== 🌍 获取 Runner 出口 IP（用于检测代理是否生效） ==========
-      - name: 🌍 获取 GitHub Runner 出口 IP（用于检测代理是否生效）
+      - name: 🌍 获取 GitHub Runner 出口 IP...
         run: |
           echo "🌍 获取 GitHub Runner 出口 IP..."
           RUNNER_IP="$(curl -fsS https://api.ipify.org || true)"
@@ -99,38 +98,38 @@ jobs:
           fi
 
       # ========== 🚀 执行阶段 ==========
-
-      - name: 🎯 运行续期脚本
+      - name: 🎯 运行续期脚本（xvfb-run）
         env:
           # 🔐 账号信息
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
-          # 📧 邮箱验证码（Outlook IMAP）
+
+          # 🌐 代理（Playwright 原生 proxy 参数在 renewal.py 内解析）
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+
+          # 🌍 Runner 出口 IP（上一步写入 $GITHUB_ENV）
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+
+          # 🔧 FlareSolverr（可保留）
+          FLARESOLVERR_URL: 'http://localhost:8191/v1'
+
+          # 🤖 续期页图片验证码识别 API（可选，不填将用脚本默认值）
+          CAPTCHA_API_URL: ${{ secrets.CAPTCHA_API_URL }}
+
+          # 📧 方案B：Outlook 邮箱验证码（IMAP）
           MAIL_IMAP_HOST: ${{ secrets.MAIL_IMAP_HOST }}
           MAIL_IMAP_USER: ${{ secrets.MAIL_IMAP_USER }}
           MAIL_IMAP_PASS: ${{ secrets.MAIL_IMAP_PASS }}
           MAIL_FROM_FILTER: ${{ secrets.MAIL_FROM_FILTER }}
           MAIL_SUBJECT_FILTER: ${{ secrets.MAIL_SUBJECT_FILTER }}
 
-          # 🌐 代理（Secrets）
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
-
-          # ✅ Runner 出口 IP（上一步写入 GITHUB_ENV）
-          RUNNER_IP: ${{ env.RUNNER_IP }}
-
-          # 🔧 FlareSolverr 配置（使用本地服务）
-          FLARESOLVERR_URL: 'http://localhost:8191/v1'
-
-          # 🤖 验证码识别 API
-          CAPTCHA_API_URL: ${{ secrets.CAPTCHA_API_URL }}
-
-          # 📱 Telegram 通知
+          # 📱 Telegram 通知（可选）
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
           # ⚙️ 运行配置
-          USE_HEADLESS: 'false'
+          USE_HEADLESS: 'false'     # ★ 方案B：强制非无头（Turnstile），由 xvfb 提供显示
           WAIT_TIMEOUT: '30000'
         run: |
           echo "🚀 开始执行 XServer VPS 自动续期任务..."
@@ -141,8 +140,11 @@ jobs:
           if [ -n "$XSERVER_EMAIL" ]; then echo "  ✅ XSERVER_EMAIL: 已配置"; else echo "  ❌ XSERVER_EMAIL: 未配置"; fi
           if [ -n "$XSERVER_PASSWORD" ]; then echo "  ✅ XSERVER_PASSWORD: 已配置"; else echo "  ❌ XSERVER_PASSWORD: 未配置"; fi
           if [ -n "$XSERVER_VPS_ID" ]; then echo "  ✅ XSERVER_VPS_ID: 已配置"; else echo "  ❌ XSERVER_VPS_ID: 未配置"; fi
-          if [ -n "$PROXY_SERVER" ]; then echo "  ✅ PROXY_SERVER: 已配置"; else echo "  ⚠️ PROXY_SERVER: 未配置"; fi
-          if [ -n "$RUNNER_IP" ]; then echo "  ✅ RUNNER_IP: $RUNNER_IP"; else echo "  ⚠️ RUNNER_IP: 未获取到"; fi
+          if [ -n "$PROXY_SERVER" ]; then echo "  ✅ PROXY_SERVER: 已配置"; else echo "  ⚠️ PROXY_SERVER: 未配置(可能触发邮箱验证)"; fi
+          if [ -n "$RUNNER_IP" ]; then echo "  ✅ RUNNER_IP: $RUNNER_IP"; else echo "  ⚠️ RUNNER_IP: 未获取到(将跳过强校验)"; fi
+          if [ -n "$MAIL_IMAP_HOST" ]; then echo "  ✅ MAIL_IMAP_HOST: 已配置"; else echo "  ⚠️ MAIL_IMAP_HOST: 未配置(方案B邮箱验证将不可用)"; fi
+          if [ -n "$MAIL_IMAP_USER" ]; then echo "  ✅ MAIL_IMAP_USER: 已配置"; else echo "  ⚠️ MAIL_IMAP_USER: 未配置(方案B邮箱验证将不可用)"; fi
+          if [ -n "$MAIL_IMAP_PASS" ]; then echo "  ✅ MAIL_IMAP_PASS: 已配置"; else echo "  ⚠️ MAIL_IMAP_PASS: 未配置(方案B邮箱验证将不可用)"; fi
           if [ -n "$CAPTCHA_API_URL" ]; then echo "  ✅ CAPTCHA_API_URL: 已配置"; else echo "  ⚠️ CAPTCHA_API_URL: 未配置(将使用脚本默认值)"; fi
           if [ -n "$FLARESOLVERR_URL" ]; then echo "  ✅ FlareSolverr: $FLARESOLVERR_URL"; else echo "  ❌ FlareSolverr: 未配置"; fi
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -162,34 +164,39 @@ jobs:
           echo "✅ 续期任务执行完成"
 
       # ========== 📊 结果处理 ==========
-      - name: 📊 显示运行结果（含 Artifact 获取提示）
+      - name: 📊 显示运行结果（失败时提示 Artifact 入口）
         if: always()
         run: |
           echo "📊 ========== 运行结果摘要 =========="
           if [ -f "README.md" ]; then
-            echo "📄 README.md:"
+            echo "✅ README.md:"
             cat README.md
           else
-            echo "⚠️ 未找到 README.md"
+            echo "⚠️ 未生成 README.md"
           fi
-          echo ""
 
+          echo ""
           if [ -f "cache.json" ]; then
-            echo "🗃️ cache.json:"
+            echo "✅ cache.json:"
             cat cache.json | python3 -m json.tool
           else
-            echo "ℹ️ 未生成 cache.json"
+            echo "⚠️ 未生成 cache.json"
           fi
-          echo ""
 
-          echo "📝 最新日志(最后 120 行):"
-          if [ -f "renewal.log" ]; then
-            tail -n 120 renewal.log
-          else
-            echo "⚠️ 未找到 renewal.log"
-          fi
           echo ""
-          echo "📦 若 Playwright 崩溃 / 需要截图排查：请在本次 Run 页面顶部找到 Artifacts 下载 renewal-logs-<run_number>"
+          echo "📝 最新日志(最后 150 行):"
+          if [ -f "renewal.log" ]; then
+            tail -n 150 renewal.log
+          else
+            echo "⚠️ 未生成 renewal.log"
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 如 Playwright/登录失败，请到本次 Run 页面打开 Artifacts："
+          echo "   - renewal-logs-${{ github.run_number }}"
+          echo "   - 里面包含 renewal.log 和 *.png 截图"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: 📦 上传运行日志与截图（Artifacts）
         if: always()
@@ -200,6 +207,7 @@ jobs:
             renewal.log
             *.png
             cache.json
+            README.md
           retention-days: 30
 
       - name: 💾 提交状态更新
